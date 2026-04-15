@@ -1,0 +1,654 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import ast
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
+from imblearn.over_sampling import RandomOverSampler
+import shap
+
+# Optional libraries
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except Exception:
+    XGB_AVAILABLE = False
+
+try:
+    from lime.lime_tabular import LimeTabularExplainer
+    LIME_AVAILABLE = True
+except Exception:
+    LIME_AVAILABLE = False
+
+try:
+    from streamlit_lottie import st_lottie
+    import json
+    LOTTIE_AVAILABLE = True
+except Exception:
+    LOTTIE_AVAILABLE = False
+
+# MLP
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+st.set_page_config(page_title="Recruitment ML + XAI", layout="wide")
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+def parse_list_cell(cell):
+    if pd.isna(cell):
+        return []
+    if isinstance(cell, list):
+        return cell
+    text = str(cell).strip()
+    try:
+        val = ast.literal_eval(text)
+        if isinstance(val, (list, tuple, set)):
+            return [str(x).strip() for x in val]
+    except Exception:
+        pass
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1]
+        parts = [p.strip().strip("'").strip('"') for p in inner.split(",") if p.strip()]
+        return parts
+    if "," in text:
+        return [p.strip() for p in text.split(",") if p.strip()]
+    if text.lower() in ["", "none", "nan", "nan.0"]:
+        return []
+    return [text]
+
+def compute_skill_overlap(candidate_skills, job_skills):
+    if not job_skills:
+        return 0.0, 0, len(candidate_skills)
+    cand_set = set([s.lower() for s in candidate_skills])
+    job_set = set([s.lower() for s in job_skills])
+    inter = cand_set.intersection(job_set)
+    return len(inter)/len(job_set), len(inter), len(cand_set)
+
+def preprocess_dataframe(df, fit_encoders=False):
+    df = df.copy()
+    drop_cols = ["candidate_id", "resume_text", "job_id", "application_date"]
+    df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True, errors="ignore")
+
+    df["skills_parsed"] = df.get("skills", "").apply(parse_list_cell)
+    df["job_skills_parsed"] = df.get("job_required_skills", "").apply(parse_list_cell)
+    df["certs_parsed"] = df.get("certifications", "").apply(parse_list_cell)
+
+    df["num_skills"] = df["skills_parsed"].apply(len)
+    df["num_job_skills"] = df["job_skills_parsed"].apply(len)
+    df["num_certs"] = df["certs_parsed"].apply(len)
+
+    if "skill_match_score" in df.columns:
+        df["skill_match_score_computed"] = pd.to_numeric(df["skill_match_score"], errors="coerce").fillna(0)
+    else:
+        df["skill_match_score_computed"] = [
+            compute_skill_overlap(cs, js)[0] for cs, js in zip(df["skills_parsed"], df["job_skills_parsed"])
+        ]
+    df["skill_overlap_count"] = [
+        compute_skill_overlap(cs, js)[1] for cs, js in zip(df["skills_parsed"], df["job_skills_parsed"])
+    ]
+
+    df["years_experience"] = pd.to_numeric(df.get("years_experience", 0), errors="coerce").fillna(0)
+    df["age"] = pd.to_numeric(df.get("age", 25), errors="coerce").fillna(25)
+
+    y = None
+    if "label" in df.columns:
+        y_raw = df["label"].astype(str).str.lower().str.strip()
+        y = y_raw.map(lambda x: 1 if x in ["hired","yes","1","true","selected"] else 0)
+
+    features = pd.DataFrame({
+        "age": df["age"],
+        "years_experience": df["years_experience"],
+        "num_skills": df["num_skills"],
+        "num_job_skills": df["num_job_skills"],
+        "skill_match_score": df["skill_match_score_computed"],
+        "skill_overlap_count": df["skill_overlap_count"],
+        "num_certs": df["num_certs"]
+    })
+
+    cat_cols = ["gender","education_level","job_title"]
+    if fit_encoders:
+        st.session_state.encoders = {}
+        for col in cat_cols:
+            if col not in df.columns:
+                df[col] = "NA"
+            le = LabelEncoder()
+            vals = df[col].fillna("NA").astype(str)
+            le.fit(vals)
+            st.session_state.encoders[col] = le
+            features[col] = le.transform(vals)
+        st.session_state.feature_columns = list(features.columns)
+        st.session_state.scaler = StandardScaler()
+        features = pd.DataFrame(
+            st.session_state.scaler.fit_transform(features),
+            columns=st.session_state.feature_columns, index=df.index
+        )
+    else:
+        for col in cat_cols:
+            if col not in df.columns:
+                df[col] = "NA"
+            le = st.session_state.encoders.get(col, None)
+            vals = df[col].fillna("NA").astype(str)
+            if le is None:
+                le = LabelEncoder()
+                le.fit(vals)
+                st.session_state.encoders[col] = le
+            mapped = []
+            for v in vals:
+                try:
+                    mapped.append(int(le.transform([v])[0]))
+                except Exception:
+                    new_classes = list(le.classes_)+[v]
+                    le.classes_ = np.array(new_classes)
+                    mapped.append(int(le.transform([v])[0]))
+            features[col] = mapped
+        features = pd.DataFrame(
+            st.session_state.scaler.transform(features),
+            columns=st.session_state.feature_columns, index=df.index
+        )
+    return features, y
+
+def ensure_shap_np_data(shap_exp):
+	"""
+	Ensure shap.Explanation.data and .values are numpy arrays with compatible 2D shapes,
+	and set feature_names from session state when available.
+	"""
+	try:
+		# convert data to numpy 2D array
+		if hasattr(shap_exp, "data"):
+			if isinstance(shap_exp.data, (pd.DataFrame, pd.Series)):
+				shap_exp.data = shap_exp.data.values
+			shap_exp.data = np.asarray(shap_exp.data)
+			# force 2D for data
+			if shap_exp.data.ndim == 1:
+				shap_exp.data = shap_exp.data.reshape(1, -1)
+
+		# convert values to numpy and force 2D with same n_features as data
+		if hasattr(shap_exp, "values"):
+			shap_exp.values = np.asarray(shap_exp.values)
+			if shap_exp.values.ndim == 1:
+				shap_exp.values = shap_exp.values.reshape(1, -1)
+			# if values shape is (n_features,) or (n_samples,) try to align to data
+			if hasattr(shap_exp, "data"):
+				n_samples, n_feats = shap_exp.data.shape
+				# if values have shape (n_feats,) make it (1, n_feats)
+				if shap_exp.values.shape == (n_feats,):
+					shap_exp.values = shap_exp.values.reshape(1, n_feats)
+				# if values have shape (n_feats, 1) transpose
+				if shap_exp.values.shape == (n_feats, 1):
+					shap_exp.values = shap_exp.values.T
+				# if values have shape (n_samples*n_classes, n_feats) or other, try to keep first n_samples
+				if shap_exp.values.ndim == 2 and shap_exp.values.shape[1] == n_feats and shap_exp.values.shape[0] != n_samples:
+					# prefer slicing first n_samples if reasonable
+					if shap_exp.values.shape[0] > n_samples:
+						shap_exp.values = shap_exp.values[:n_samples, :]
+					else:
+						# expand values to match samples by repeating
+						shap_exp.values = np.repeat(shap_exp.values, n_samples, axis=0)[:n_samples, :]
+
+		# base_values -> ensure array length matches samples when possible
+		if hasattr(shap_exp, "base_values"):
+			bv = np.asarray(shap_exp.base_values)
+			if bv.ndim == 0:
+				# leave scalar
+				shap_exp.base_values = bv.item()
+			else:
+				# if scalar per feature, try to reduce to per-sample if needed
+				if hasattr(shap_exp, "values") and shap_exp.values.ndim == 2:
+					if bv.size == shap_exp.values.shape[1] and shap_exp.values.shape[0] == 1:
+						# leave as-is (per-feature) — SHAP can accept this in some contexts
+						shap_exp.base_values = bv
+					elif bv.size == shap_exp.values.shape[0]:
+						shap_exp.base_values = bv
+					elif bv.size == 1:
+						shap_exp.base_values = bv.item()
+					else:
+						# fallback: take first element or reshape
+						shap_exp.base_values = bv.reshape(1, -1)[0] if bv.size >= 1 else bv
+
+		# set feature names if missing
+		if (not hasattr(shap_exp, "feature_names") or shap_exp.feature_names is None) and "feature_columns" in st.session_state:
+			shap_exp.feature_names = st.session_state.feature_columns
+
+	except Exception:
+		# do not raise here; plotting will show a more specific error if still broken
+		pass
+	return shap_exp
+
+def ensure_shap_single_sample(shap_exp):
+	"""
+	Ensure waterfall receives a single explanation (1D values / single-row data).
+	If shap_exp contains a matrix of explanations, extract the first sample into a new Explanation.
+	"""
+	try:
+		vals = np.asarray(getattr(shap_exp, "values", np.array([])))
+		data = np.asarray(getattr(shap_exp, "data", np.array([]))) if hasattr(shap_exp, "data") else None
+		# If values are 2D and have multiple rows, pick the first row
+		if vals.ndim == 2 and vals.shape[0] >= 1:
+			# if there is more than one sample, pick the first
+			v = vals[0]
+			# normalize base_values
+			bv = shap_exp.base_values if hasattr(shap_exp, "base_values") else None
+			try:
+				bv_arr = np.asarray(bv)
+				if bv_arr.ndim == 2 and bv_arr.shape[0] >= 1:
+					bv = bv_arr[0]
+				elif bv_arr.ndim == 1 and bv_arr.shape[0] == vals.shape[0]:
+					bv = bv_arr[0]
+			except Exception:
+				# keep bv as-is
+				pass
+			d = data[0] if (data is not None and data.ndim == 2) else data
+			return shap.Explanation(values=v,
+									base_values=bv,
+									data=d,
+									feature_names=getattr(shap_exp, "feature_names", None))
+	except Exception:
+		# fallback: return original
+		pass
+	return shap_exp
+
+# ----------------------------
+# Sidebar
+# ----------------------------
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Pages", ["Home","Data Loading","Training","Prediction","Reports"])
+
+# ----------------------------
+# Home
+# ----------------------------
+if page=="Home":
+    st.title("Recruitment ML + XAI")
+    st.markdown("""
+    - Upload dataset
+    - Train models (LogisticRegression, MLP, XGBoost)
+    - Predict candidates
+    - Explain predictions with SHAP & LIME
+    """)
+    if LOTTIE_AVAILABLE:
+        try:
+            with open("AI ANIMATION.json","r") as f:
+                lottie_json = json.load(f)
+            st_lottie(lottie_json,height=250)
+        except:
+            st.info("Failed to load Lottie file AI ANIMATION.json")
+    else:
+        st.info("Install streamlit-lottie for animation")
+
+# ----------------------------
+# Data Loading
+# ----------------------------
+elif page=="Data Loading":
+    st.title("Upload Dataset")
+    file = st.file_uploader("CSV or Excel", type=["csv","xlsx"])
+    if file:
+        try:
+            df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
+            st.session_state.df_raw = df
+            st.success("Dataset loaded")
+            st.dataframe(df.head())
+        except Exception as e:
+            st.error(e)
+    elif "df_raw" in st.session_state:
+        st.dataframe(st.session_state.df_raw.head())
+
+# ----------------------------
+# Training
+# ----------------------------
+elif page=="Training":
+    st.title("Train Models (All at once)")
+    if "df_raw" not in st.session_state:
+        st.warning("Upload dataset first")
+    else:
+        df = st.session_state.df_raw
+        X, y = preprocess_dataframe(df, fit_encoders=True)
+        X_train,X_test,y_train,y_test = train_test_split(X,y,stratify=y,test_size=0.2,random_state=42)
+        ros = RandomOverSampler(random_state=42)
+        X_train,y_train = ros.fit_resample(X_train,y_train)
+
+        models = {}
+
+        # Logistic Regression
+        lr = LogisticRegression(max_iter=500)
+        lr.fit(X_train,y_train)
+        models["LogisticRegression"] = lr
+
+        # MLP
+        input_dim = X_train.shape[1]
+        mlp = Sequential([
+            Dense(64,input_dim=input_dim,activation="relu"),
+            Dropout(0.2),
+            Dense(32,activation="relu"),
+            Dense(1,activation="sigmoid")
+        ])
+        mlp.compile(optimizer=Adam(0.001),loss="binary_crossentropy",metrics=["accuracy"])
+        es = EarlyStopping(monitor="val_loss",patience=5,restore_best_weights=True)
+        mlp.fit(X_train,y_train,validation_split=0.2,epochs=50,batch_size=32,callbacks=[es],verbose=0)
+        models["MLP"] = mlp
+
+        # XGBoost
+        if XGB_AVAILABLE:
+            xgb_clf = xgb.XGBClassifier(use_label_encoder=False,eval_metric="logloss")
+            xgb_clf.fit(X_train,y_train)
+            models["XGBoost"] = xgb_clf
+
+        st.session_state.models = models
+        st.session_state.X_test = X_test
+        st.session_state.y_test = y_test
+        st.success(f"Trained: {list(models.keys())}")
+
+        # Show confusion matrices
+        fig_cm = plt.figure(figsize=(5*len(models),4))
+        for i,(name,model) in enumerate(models.items()):
+            if name=="MLP":
+                y_pred = (model.predict(X_test)>=0.5).astype(int)
+            else:
+                y_pred = model.predict(X_test)
+            cm = confusion_matrix(y_test,y_pred)
+            ax = fig_cm.add_subplot(1,len(models),i+1)
+            ax.imshow(cm,cmap="Blues")
+            ax.set_title(name)
+            for (j,k), val in np.ndenumerate(cm):
+                ax.text(k,j,str(val),ha="center",va="center",color="w")
+        st.pyplot(fig_cm)
+
+# ----------------------------
+# Prediction
+# ----------------------------
+elif page=="Prediction":
+    st.title("Candidate Prediction")
+    if "models" not in st.session_state:
+        st.warning("Train models first")
+    else:
+        age = st.number_input("Age",18,80,30)
+        exp = st.number_input("Years Experience",0,60,3)
+        gender = st.selectbox("Gender",["Male","Female","Other"])
+        edu = st.selectbox("Education",["High School","Diploma","Bachelors","Masters","PhD"])
+        job_title = st.text_input("Job Title","Software Engineer")
+        skills = st.text_area("Skills","Python, SQL")
+        job_skills = st.text_area("Job Required Skills","Python, Machine Learning")
+        certs = st.text_input("Certifications","PMP")
+
+        model_choice = st.selectbox("Model", list(st.session_state.models.keys()))
+
+        if st.button("Predict"):
+            row = {"age":age,"years_experience":exp,"gender":gender,
+                   "education_level":edu,"job_title":job_title,
+                   "skills":skills,"job_required_skills":job_skills,
+                   "certifications":certs}
+            X_input,_ = preprocess_dataframe(pd.DataFrame([row]), fit_encoders=False)
+            model = st.session_state.models[model_choice]
+
+            # Prediction: compute for selected model AND for all trained models for comparison
+            try:
+                all_results = {}
+                for name, mdl in st.session_state.models.items():
+                    try:
+                        if name == "MLP":
+                            # Keras model returns array; take scalar prob
+                            prob_val = float(np.asarray(mdl.predict(X_input)).ravel()[0])
+                            pred_val = int(prob_val >= 0.5)
+                        else:
+                            # prefer predict_proba when available (gives proper probability)
+                            if hasattr(mdl, "predict_proba"):
+                                prob_val = float(mdl.predict_proba(X_input)[0][1])
+                                pred_val = int(prob_val >= 0.5)
+                            else:
+                                # fallback to predict (may return class label or array)
+                                pred_raw = mdl.predict(X_input)
+                                try:
+                                    pred_val = int(np.asarray(pred_raw).ravel()[0])
+                                except Exception:
+                                    pred_val = int(pred_raw[0])
+                                # probability unknown when predict_proba not available
+                                prob_val = None
+                        all_results[name] = {"pred": pred_val, "prob": prob_val}
+                    except Exception as inner_e:
+                        all_results[name] = {"pred": "error", "prob": str(inner_e)}
+
+                # Show chosen model prominently
+                chosen = all_results.get(model_choice, None)
+                if chosen is not None and chosen.get("pred") != "error":
+                    ch_pred = chosen["pred"]
+                    ch_prob = chosen["prob"]
+                    st.write("Prediction (selected model):", "Hired ✅" if ch_pred else "Rejected ❌")
+                    if ch_prob is not None:
+                        st.write(f"Hiring Probability ({model_choice}): {ch_prob:.2f}")
+                else:
+                    st.warning(f"Selected model '{model_choice}' prediction failed")
+                    if chosen:
+                        st.write(chosen["prob"])
+
+                # Show quick comparison table for all models
+                try:
+                    summary_rows = []
+                    for nm, res in all_results.items():
+                        prob_display = f"{res['prob']:.2f}" if isinstance(res["prob"], (float, np.floating)) else str(res["prob"])
+                        pred_display = res["pred"]
+                        summary_rows.append([nm, pred_display, prob_display])
+                    df_cmp = pd.DataFrame(summary_rows, columns=["Model", "Predicted Label", "Probability"])
+                    st.write("### All models — predictions")
+                    st.dataframe(df_cmp)
+                except Exception:
+                    st.write(all_results)
+            except Exception as e:
+                st.warning("Prediction step failed")
+                st.exception(e)
+
+            # SHAP explanation
+            try:
+                X_test = st.session_state.X_test
+
+                # use the unified Explainer API and compute explanation for the input
+                explainer = shap.Explainer(model, X_test)
+                sv = explainer(X_input)
+
+                # Determine correct slicing for waterfall
+                shap_for_waterfall = None
+                try:
+                    # multi-output models: sv.values can be a list of arrays (one per output)
+                    if isinstance(sv.values, list):
+                        # take first output, first sample
+                        vals0 = sv.values[0]  # shape (n_samples, n_features)
+                        base0 = sv.base_values[0] if isinstance(sv.base_values, (list, tuple, np.ndarray)) else sv.base_values
+                        data0 = sv.data[0] if hasattr(sv, "data") and np.asarray(sv.data).ndim == 2 else sv.data
+                        # build a single-sample Explanation
+                        shap_for_waterfall = shap.Explanation(values=vals0[0],
+                                                             base_values=(base0[0] if getattr(base0, "ndim", None) == 2 else base0),
+                                                             data=(data0 if data0 is None or np.asarray(data0).ndim==1 else data0[0]),
+                                                             feature_names=getattr(sv, "feature_names", None))
+                    else:
+                        # sv.values is an ndarray; sv[0] yields a single-sample Explanation
+                        if np.asarray(sv.values).ndim == 2:
+                            shap_for_waterfall = sv[0]  # Explanation for first (and only) sample
+                        else:
+                            shap_for_waterfall = sv
+                except Exception:
+                    # fallback to passing the raw sv (SHAP will error with helpful message if incompatible)
+                    shap_for_waterfall = sv
+
+                fig, ax = plt.subplots()
+                shap.plots.waterfall(shap_for_waterfall, show=False)
+
+                # add axis labels and short explanatory text (acts like a legend)
+                try:
+                    ax = plt.gca()
+                    ax.set_xlabel("SHAP value (impact on model output)")
+                    ax.set_ylabel("Feature")
+                    fig.text(0.01, 0.99,
+                             "Note: Positive SHAP → increases predicted probability; Negative SHAP → decreases it",
+                             ha="left", va="top", fontsize=8)
+                except Exception:
+                    pass
+
+                st.pyplot(fig)
+            except Exception as e:
+                st.warning("SHAP explanation failed")
+                st.exception(e)
+
+            # LIME explanation
+            if LIME_AVAILABLE:
+                try:
+                    explainer = LimeTabularExplainer(
+                        training_data=np.array(st.session_state.X_test),
+                        feature_names=st.session_state.feature_columns,
+                        class_names=["Rejected","Hired"],
+                        mode="classification"
+                    )
+                    func = model.predict if model_choice=="MLP" else model.predict_proba
+                    exp_lime = explainer.explain_instance(
+                        X_input.iloc[0].values, func, num_features=5
+                    )
+                    st.write("### LIME Explanation")
+                    st.write(exp_lime.as_list())
+                except Exception as e:
+                    st.warning("LIME explanation failed")
+                    st.exception(e)
+
+# ----------------------------
+# Reports
+# ----------------------------
+elif page=="Reports":
+    st.title("Reports")
+    if "models" not in st.session_state:
+        st.warning("No trained models")
+    else:
+        models = st.session_state.models
+        X_test, y_test = st.session_state.X_test, st.session_state.y_test
+        results = []
+
+        # Confusion matrix
+        fig_cm = plt.figure(figsize=(5*len(models),4))
+        for i,(name,model) in enumerate(models.items()):
+            if name=="MLP":
+                y_pred = (model.predict(X_test)>=0.5).astype(int)
+            else:
+                y_pred = model.predict(X_test)
+            cm = confusion_matrix(y_test,y_pred)
+            ax = fig_cm.add_subplot(1,len(models),i+1)
+            ax.imshow(cm,cmap="Blues")
+            ax.set_title(name)
+            for (j,k), val in np.ndenumerate(cm):
+                ax.text(k,j,str(val),ha="center",va="center",color="w")
+            # Metrics
+            acc = accuracy_score(y_test,y_pred)
+            prec = precision_score(y_test,y_pred)
+            rec = recall_score(y_test,y_pred)
+            f1 = f1_score(y_test,y_pred)
+            results.append([name,acc,prec,rec,f1])
+        st.pyplot(fig_cm)
+
+        # ROC
+        fig_roc = plt.figure()
+        for name,model in models.items():
+            if name=="MLP":
+                y_prob = model.predict(X_test)
+            elif hasattr(model,"predict_proba"):
+                y_prob = model.predict_proba(X_test)[:,1]
+            else:
+                continue
+            fpr,tpr,_ = roc_curve(y_test,y_prob)
+            plt.plot(fpr,tpr,label=f"{name} AUC={auc(fpr,tpr):.2f}")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.legend()
+        st.pyplot(fig_roc)
+
+        st.dataframe(pd.DataFrame(results,columns=["Model","Accuracy","Precision","Recall","F1"]))
+
+        # Accuracy bar chart (new)
+        try:
+            df_res = pd.DataFrame(results, columns=["Model","Accuracy","Precision","Recall","F1"])
+            fig_acc = plt.figure(figsize=(6,4))
+            names = df_res["Model"].astype(str).values
+            accs = df_res["Accuracy"].astype(float).values
+            bars = plt.bar(names, accs, color=["#4c72b0"]*len(names))
+            plt.ylim(0,1)
+            plt.xlabel("Model")
+            plt.ylabel("Accuracy")
+            plt.title("Model Accuracy")
+            # annotate bars
+            for bar, val in zip(bars, accs):
+                plt.text(bar.get_x() + bar.get_width()/2, val + 0.01, f"{val:.2f}", ha="center", va="bottom", fontsize=9)
+            st.pyplot(fig_acc)
+        except Exception as e:
+            st.warning("Accuracy plot failed")
+            st.exception(e)
+
+        # Global SHAP
+        st.subheader("Global SHAP Feature Importance")
+        try:
+            # sample a small subset of X_test for fast SHAP computations (3-4 samples)
+            X_shap_sample = None
+            try:
+                if isinstance(X_test, pd.DataFrame) or isinstance(X_test, pd.Series):
+                    rng = np.random.RandomState(42)
+                    sample_size = min(4, len(X_test))
+                    idx = rng.choice(len(X_test), size=sample_size, replace=False)
+                    X_shap_sample = X_test.iloc[idx]
+                else:
+                    rng = np.random.RandomState(42)
+                    sample_size = min(4, X_test.shape[0])
+                    idx = rng.choice(X_test.shape[0], size=sample_size, replace=False)
+                    X_shap_sample = X_test[idx]
+            except Exception:
+                X_shap_sample = X_test if X_test is not None else None
+
+            for name,model in models.items():
+                st.write(f"### {name}")
+                # use the small sample (X_shap_sample) instead of full X_test for SHAP
+                if name=="MLP":
+                    explainer = shap.KernelExplainer(model.predict, X_shap_sample)
+                    shap_vals = explainer.shap_values(X_shap_sample)
+                    shap_exp = shap.Explanation(values=shap_vals[0],
+                                                base_values=explainer.expected_value,
+                                                data=X_shap_sample.values if hasattr(X_shap_sample, "values") else X_shap_sample)
+                elif name=="XGBoost":
+                    explainer = shap.Explainer(model)
+                    shap_full = explainer(X_shap_sample)
+                    shap_exp = shap.Explanation(values=shap_full.values,
+                                                base_values=shap_full.base_values,
+                                                data=X_shap_sample.values if hasattr(X_shap_sample, "values") else X_shap_sample)
+                else:
+                    explainer = shap.LinearExplainer(model, X_shap_sample)
+                    shap_full = explainer(X_shap_sample)
+                    shap_exp = shap.Explanation(values=shap_full.values,
+                                                base_values=shap_full.base_values,
+                                                data=X_shap_sample.values if hasattr(X_shap_sample, "values") else X_shap_sample)
+
+                shap_exp = ensure_shap_np_data(shap_exp)
+
+                fig_summary = plt.figure()
+                shap.summary_plot(shap_exp.values, shap_exp.data, show=False)
+                # add axis labels and explanatory text for summary (dot) plot
+                try:
+                    ax = plt.gca()
+                    ax.set_xlabel("SHAP value (impact on model output)")
+                    ax.set_ylabel("Features")
+                    fig_summary.text(0.01, 0.99,
+                                     "Note: Each dot shows impact of a feature value on the output.\nX = SHAP value; Y = feature",
+                                     ha="left", va="top", fontsize=8)
+                except Exception:
+                    pass
+                st.pyplot(fig_summary)
+                fig_bar = plt.figure()
+                shap.summary_plot(shap_exp.values, shap_exp.data, plot_type="bar", show=False)
+                # add axis labels and explanatory text for bar plot
+                try:
+                    ax = plt.gca()
+                    ax.set_xlabel("Mean |SHAP value| (feature importance)")
+                    ax.set_ylabel("Features")
+                    fig_bar.text(0.01, 0.99, "Note: Higher mean |SHAP value| → more important feature",
+                                 ha="left", va="top", fontsize=8)
+                except Exception:
+                    pass
+                st.pyplot(fig_bar)
+        except Exception as e:
+            st.warning("Global SHAP failed")
+            st.exception(e)
